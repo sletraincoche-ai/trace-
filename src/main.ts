@@ -1,10 +1,12 @@
 import "./styles.css";
-import { DEFAULT_CLIP_MODEL, DEFAULT_DETECTOR_MODEL } from "./config";
+import { DEFAULT_CLIP_MODEL, DEFAULT_DETECTOR_MODEL, DEFAULT_VOCAB } from "./config";
 import { allPhotos, clearPhotos, type PhotoRecord } from "./db";
 import { filesFromDrop, filesFromInput, importFiles, type ImportProgress, type IncomingFile } from "./importer";
 import { ModelClient } from "./models/client";
-import type { FileProgress, LoadedModel } from "./models/protocol";
+import type { DetectResult, FileProgress, LoadedModel } from "./models/protocol";
+import { loadSettings, parseVocab, saveSettings, settings } from "./settings";
 import { fmtBytes, fmtDate, fmtDateTime, h } from "./ui/dom";
+import { openViewer } from "./ui/viewer";
 
 // ---------------------------------------------------------------- state
 const state = {
@@ -35,6 +37,7 @@ const storageSlot = h("span", { class: "muted small" });
 const modelSlot = h("section", { class: "panel" });
 const importSlot = h("div");
 const gridSlot = h("div");
+const settingsSlot = h("section", { class: "panel" });
 const folderInput = h("input", { type: "file", multiple: true, hidden: true }) as HTMLInputElement;
 folderInput.setAttribute("webkitdirectory", "");
 const filesInput = h("input", {
@@ -62,6 +65,7 @@ app.append(
     importSlot,
     gridSlot,
   ),
+  settingsSlot,
   folderInput,
   filesInput,
 );
@@ -108,6 +112,7 @@ async function onClear() {
   if (!state.photos.length) return;
   if (!confirm(`Remove all ${state.photos.length} photos from this browser's library?`)) return;
   await clearPhotos();
+  detectCache.clear();
   state.lastImport = null;
   await refreshPhotos();
   renderImport();
@@ -344,12 +349,16 @@ function renderGrid() {
     h(
       "div",
       { class: "grid" },
-      state.photos.map((p) => {
+      state.photos.map((p, i) => {
         const url = URL.createObjectURL(p.thumb);
         thumbUrls.push(url);
         return h(
           "figure",
-          { class: "ph", title: `${p.relPath}\n${p.width}×${p.height} stored · ${fmtBytes(p.size)} original` },
+          {
+            class: "ph",
+            title: `${p.relPath}\n${p.width}×${p.height} stored · ${fmtBytes(p.size)} original`,
+            onclick: () => openViewer(i, viewerDeps),
+          },
           h("img", { src: url, loading: "lazy", alt: p.name }),
           h(
             "figcaption",
@@ -376,7 +385,72 @@ async function refreshStorage() {
   storageSlot.textContent = `Stored locally: ${fmtBytes(usage)}${persisted ? " (persistent)" : ""}`;
 }
 
+// ---------------------------------------------------------------- detection (single photo, step 2)
+// In-memory only for now; persisted in IndexedDB in step 3.
+const detectCache = new Map<string, DetectResult>();
+const vocabKey = () => settings.vocab.join("\u0000");
+const cacheKey = (p: PhotoRecord) => `${p.id}\u0001${vocabKey()}`;
+
+const viewerDeps = {
+  photos: () => state.photos,
+  modelsReady: () => state.model.ready,
+  cached: (p: PhotoRecord) => detectCache.get(cacheKey(p)),
+  detect: async (p: PhotoRecord) => {
+    const r = await models.detect(p.image, settings.vocab, 0.05);
+    detectCache.set(cacheKey(p), r);
+    return r;
+  },
+  onThreshold: (t: number) => {
+    void saveSettings({ threshold: t });
+    renderSettings();
+  },
+};
+
+// ---------------------------------------------------------------- settings
+function renderSettings() {
+  const area = h("textarea", { rows: 8, spellcheck: false }) as HTMLTextAreaElement;
+  area.value = settings.vocab.join("\n");
+  const msg = h("span", { class: "muted small" });
+  const save = async (vocab: string[]) => {
+    if (!vocab.length) return (msg.textContent = "The vocabulary cannot be empty.");
+    await saveSettings({ vocab });
+    renderSettings();
+  };
+  settingsSlot.replaceChildren(
+    h(
+      "details",
+      null,
+      h("summary", null, h("h2", { style: "display:inline" }, "Detection settings")),
+      h(
+        "p",
+        { class: "muted small" },
+        `${settings.vocab.length} labels, one per line. Each is queried as "a photo of a <label>". ` +
+          `Score threshold: ${settings.threshold.toFixed(2)} (adjust it in the photo viewer).`,
+      ),
+      area,
+      h(
+        "div",
+        { class: "row" },
+        h("button", { onclick: () => save(parseVocab(area.value)) }, "Save vocabulary"),
+        h("button", { class: "ghost", onclick: () => save([...DEFAULT_VOCAB]) }, "Reset to defaults"),
+        msg,
+      ),
+      h(
+        "p",
+        { class: "muted small" },
+        'Privacy: "person" is never an inventory label. It is queried internally only to discard boxes that are mostly a person; those boxes are never stored or shown. No face detection or recognition is used.',
+      ),
+    ),
+  );
+  // Keep the panel open after saving.
+  (settingsSlot.firstElementChild as HTMLDetailsElement).open = settingsOpen;
+  settingsSlot.firstElementChild!.addEventListener("toggle", (e) => (settingsOpen = (e.target as HTMLDetailsElement).open));
+}
+let settingsOpen = false;
+
 // ---------------------------------------------------------------- boot
+await loadSettings();
+renderSettings();
 renderBadge();
 renderModels();
 renderImport();

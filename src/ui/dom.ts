@@ -47,3 +47,10 @@ export function fmtDateTime(ms: number): string {
     minute: "2-digit",
   });
 }
+
+/** Fragment of children, skipping null/false like h(). */
+export function frag(...children: (Child | Child[])[]): DocumentFragment {
+  const f = document.createDocumentFragment();
+  for (const c of children.flat()) if (c !== null && c !== undefined && c !== false) f.append(c instanceof Node ? c : String(c));
+  return f;
+}

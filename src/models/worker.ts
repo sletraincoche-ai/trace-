@@ -6,8 +6,10 @@ import {
   CLIPVisionModelWithProjection,
   env,
   pipeline,
+  RawImage,
 } from "@huggingface/transformers";
-import type { FileProgress, FromWorker, LoadedModel, ModelConfig, ModelKey, ToWorker } from "./protocol";
+import { PERSON_QUERY, postProcess, promptFor, type RawDetection } from "../detect-post";
+import type { DetectRequest, FileProgress, FromWorker, LoadedModel, ModelConfig, ModelKey, ToWorker } from "./protocol";
 
 declare const self: DedicatedWorkerGlobalScope;
 const post = (m: FromWorker) => self.postMessage(m);
@@ -67,7 +69,7 @@ function onProgress(info: unknown) {
 // ---- Device / precision fallback chain.
 type Attempt = { device: "webgpu" | "wasm"; dtype: "fp16" | "fp32" | "q8" };
 
-async function attempts(): Promise<Attempt[]> {
+async function attempts(wasmOnly = false): Promise<Attempt[]> {
   const gpu = (navigator as Navigator & { gpu?: { requestAdapter(): Promise<unknown> } }).gpu;
   let hasGpu = false;
   try {
@@ -76,6 +78,7 @@ async function attempts(): Promise<Attempt[]> {
     hasGpu = false;
   }
   const wasm: Attempt[] = [{ device: "wasm", dtype: "q8" }, { device: "wasm", dtype: "fp32" }];
+  if (wasmOnly) return wasm;
   // fp16 halves the download; not every repo ships it, hence the fallback.
   return hasGpu ? [{ device: "webgpu", dtype: "fp16" }, { device: "webgpu", dtype: "fp32" }, ...wasm] : wasm;
 }
@@ -84,9 +87,10 @@ async function loadWithFallback<T>(
   key: ModelKey,
   id: string,
   load: (a: Attempt) => Promise<T>,
+  wasmOnly = false,
 ): Promise<{ value: T; info: LoadedModel }> {
   const errors: string[] = [];
-  for (const a of await attempts()) {
+  for (const a of await attempts(wasmOnly)) {
     const t0 = performance.now();
     try {
       post({ type: "stage", message: `Loading ${id} (${a.device}, ${a.dtype})…` });
@@ -102,8 +106,16 @@ async function loadWithFallback<T>(
 }
 
 // Loaded models, used by detection and embeddings in later steps.
+type Detector = (
+  image: RawImage,
+  labels: string[],
+  opts: { threshold: number; percentage: boolean },
+) => Promise<RawDetection[]>;
+
 const models: {
-  detector?: unknown;
+  detector?: Detector;
+  detectorInfo?: LoadedModel;
+  detectorId?: string;
   clipVision?: unknown;
   clipText?: unknown;
   clipProcessor?: unknown;
@@ -118,7 +130,9 @@ async function load(cfg: ModelConfig) {
   const det = await loadWithFallback("detector", cfg.detector, (a) =>
     pipeline("zero-shot-object-detection", cfg.detector, { ...common, device: a.device, dtype: a.dtype }),
   );
-  models.detector = det.value;
+  models.detector = det.value as unknown as Detector;
+  models.detectorInfo = det.info;
+  models.detectorId = cfg.detector;
   loaded.push(det.info);
 
   models.clipProcessor = await AutoProcessor.from_pretrained(cfg.clip, common);
@@ -143,11 +157,56 @@ async function load(cfg: ModelConfig) {
   });
 }
 
+async function runDetector(image: RawImage, queries: string[], floor: number): Promise<RawDetection[]> {
+  if (!models.detector) throw new Error("Detector not loaded yet");
+  return models.detector(image, queries, { threshold: floor, percentage: false });
+}
+
+async function detect(req: DetectRequest) {
+  const image = await RawImage.fromBlob(req.image);
+  // Person is queried only so that crops that are mostly a person can be
+  // discarded below; person boxes never leave this function.
+  const queries = [...req.vocab.map(promptFor), PERSON_QUERY];
+  const floor = Math.min(req.floor, 0.1);
+  const t0 = performance.now();
+  let raw: RawDetection[];
+  try {
+    raw = await runDetector(image, queries, floor);
+  } catch (err) {
+    // Some GPUs load the model but fail at inference: fall back to WASM once.
+    if (models.detectorInfo?.device !== "webgpu" || !models.detectorId) throw err;
+    const id = models.detectorId;
+    const det = await loadWithFallback(
+      "detector",
+      id,
+      (a) => pipeline("zero-shot-object-detection", id, { progress_callback: onProgress, device: a.device, dtype: a.dtype }),
+      true,
+    );
+    models.detector = det.value as unknown as Detector;
+    models.detectorInfo = det.info;
+    raw = await runDetector(image, queries, floor);
+  }
+  const ms = performance.now() - t0;
+  const detections = postProcess(raw, req.vocab, { threshold: req.floor, width: image.width, height: image.height });
+  post({
+    type: "detected",
+    reqId: req.reqId,
+    detections,
+    width: image.width,
+    height: image.height,
+    ms,
+    device: `${models.detectorInfo?.device}/${models.detectorInfo?.dtype}`,
+  });
+}
+
 self.onmessage = async (ev: MessageEvent<ToWorker>) => {
   const msg = ev.data;
   try {
     if (msg.type === "load") await load(msg.config);
+    else if (msg.type === "detect") await detect(msg);
   } catch (err) {
-    post({ type: "error", message: err instanceof Error ? err.message : String(err) });
+    const message = err instanceof Error ? err.message : String(err);
+    if (msg.type === "detect") post({ type: "detectError", reqId: msg.reqId, message });
+    else post({ type: "error", message });
   }
 };
